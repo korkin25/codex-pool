@@ -16,9 +16,12 @@ on:
     # a commit touching only charts/** does not republish the chart. Bump the
     # chart alongside a code change, or start this workflow from
     # `workflow_dispatch`.
+    # Only documentation is excluded. `charts/**` used to be here, which was
+    # wrong once this workflow started publishing the chart as well: a path
+    # filter gates the WHOLE workflow, so a chart-only commit republished
+    # neither the chart nor anything else, silently.
     paths-ignore:
       - '**/*.md'
-      - 'charts/**'
   workflow_dispatch:
 
 # The built-in GITHUB_TOKEN is the only credential this workflow needs:
