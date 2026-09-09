@@ -1,3 +1,4 @@
+{{- include "codex-pool.guard" . -}}
 {{- if .Values.ingress.enabled }}
 {{- $fullName := include "codex-pool.fullname" . -}}
 {{- $svcPort := .Values.service.port -}}

@@ -34,8 +34,10 @@ Secret that you own, so that key material never has to live in a values file.
 
 ## Fixed topology
 
-One replica, `Recreate`, one `ReadWriteOnce` volume. These are literals in the
-templates rather than values, deliberately:
+`replicaCount`, `replicas`, `autoscaling`, `podDisruptionBudget`, `strategy`,
+`persistence.accessMode(s)` and `persistence.enabled: false` all make the chart
+**fail to render**, with an explanation. This is deliberate — see
+`templates/_guard.tpl`:
 
 * provider credential files under `pool/<provider>/*.json` are read, mutated and
   rewritten with no cross-process lock, so a second writer loses refreshed OAuth

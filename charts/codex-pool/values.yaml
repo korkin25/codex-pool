@@ -6,8 +6,10 @@
 # and rewrites credential files without cross-process locking, while pending
 # OAuth login sessions live in a process-local in-memory map whose browser
 # redirect has to land back on the same process. The chart therefore hardcodes
-# one replica, the Recreate strategy and a single ReadWriteOnce volume; there
-# is deliberately no `replicaCount`, `autoscaling` or `strategy` value.
+# one replica, the Recreate strategy and a single ReadWriteOnce volume, and
+# refuses to render if `replicaCount`, `replicas`, `autoscaling`, `strategy`,
+# `podDisruptionBudget` or `persistence.accessModes` are supplied.
+# See templates/_guard.tpl.
 
 nameOverride: ""
 fullnameOverride: ""

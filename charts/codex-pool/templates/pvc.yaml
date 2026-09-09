@@ -1,3 +1,4 @@
+{{- include "codex-pool.guard" . -}}
 {{- if and .Values.persistence.enabled (not .Values.persistence.existingClaim) }}
 apiVersion: v1
 kind: PersistentVolumeClaim
@@ -17,7 +18,7 @@ metadata:
     {{- end }}
   {{- end }}
 spec:
-  # Fixed: the workload is single-writer by construction.
+  # Fixed: the workload is single-writer by construction. See templates/_guard.tpl.
   accessModes:
     - ReadWriteOnce
   {{- with .Values.persistence.storageClass }}

@@ -20,5 +20,5 @@ keywords:
   - llm
   - openai-compatible
 annotations:
-  # The chart deploys exactly one replica by design.
+  # The chart deploys exactly one replica by design; see templates/_guard.tpl.
   category: AIInfrastructure
