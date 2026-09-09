@@ -1,0 +1,265 @@
+name: Build and publish image
+
+# Push-only on purpose. Both jobs publish to the repository owner's GitHub
+# Container Registry namespace, and only refs that already required write
+# access should be able to publish: pushes to `main`, `v*` tags, and a manual
+# dispatch. A `pull_request` (or `pull_request_target`, `workflow_run`,
+# `issue_comment`) trigger would build code that has not been reviewed yet and,
+# from a fork, could not push anyway.
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*'
+    # Only documentation is excluded. `charts/**` must NOT be added here: a
+    # path filter gates the whole workflow, chart job included, so a
+    # chart-only commit would silently republish nothing at all.
+    paths-ignore:
+      - '**/*.md'
+  workflow_dispatch:
+
+# The built-in GITHUB_TOKEN is the only credential this workflow needs:
+# `packages: write` lets it push to ghcr.io under this repository's owner.
+# No repository secret has to be configured by hand.
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: build-image-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  image:
+    name: Build and publish container image
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Resolve image name
+        id: image
+        run: |
+          set -euo pipefail
+          # GHCR rejects uppercase; GITHUB_REPOSITORY may contain it.
+          echo "name=ghcr.io/${GITHUB_REPOSITORY,,}" >>"$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Extract image metadata
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ steps.image.outputs.name }}
+          labels: |
+            org.opencontainers.image.title=codex-pool
+            org.opencontainers.image.description=Reverse proxy that spreads coding-agent sessions across pooled provider accounts
+            org.opencontainers.image.licenses=MIT
+          tags: |
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,format=long
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: ./Dockerfile
+          # linux/amd64 only: the Dockerfile pins
+          # `ENV CGO_ENABLED=1 GOOS=linux GOARCH=amd64`, so any other platform
+          # would produce an amd64 binary inside a foreign-architecture image.
+          platforms: linux/amd64
+          push: true
+          pull: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: false
+
+      - name: Summarise
+        env:
+          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
+          IMAGE_TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          set -euo pipefail
+          {
+            echo "### Container image"
+            echo
+            echo "Digest: \`${IMAGE_DIGEST}\`"
+            echo
+            echo "Tags:"
+            echo '```'
+            printf '%s\n' "${IMAGE_TAGS}"
+            echo '```'
+            echo
+            echo "Pin it in the Helm chart with:"
+            echo '```yaml'
+            echo "image:"
+            echo "  digest: ${IMAGE_DIGEST}"
+            echo '```'
+          } >>"$GITHUB_STEP_SUMMARY"
+
+  chart:
+    name: Package and publish Helm chart
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # The chart's `image.tag` falls back to .Chart.AppVersion, so a chart is
+    # only worth publishing once the image it points at has actually been
+    # pushed. A failed image build must not leave a dangling chart behind.
+    needs: image
+
+    env:
+      CHART_DIR: charts/codex-pool
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: v4.2.3
+
+      - name: Resolve chart version
+        id: chart
+        run: |
+          set -euo pipefail
+
+          # Base version declared in Chart.yaml, stripped of any pre-release or
+          # build-metadata suffix so we can append our own.
+          base="$(awk '$1 == "version:" { gsub(/"/, "", $2); print $2; exit }' "${CHART_DIR}/Chart.yaml")"
+          base="${base%%-*}"
+          base="${base%%+*}"
+          if [ -z "${base}" ]; then
+            echo "::error::could not read version: from ${CHART_DIR}/Chart.yaml"
+            exit 1
+          fi
+
+          # A chart version MUST be valid SemVer, and it must be unique: a
+          # registry happily overwrites an existing tag, and a consumer that
+          # caches by version would keep serving whatever it resolved first.
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            # Release build. `v1.2.3` -> chart 1.2.3, matching the image tag
+            # that docker/metadata-action produced from the same tag.
+            version="${GITHUB_REF_NAME#v}"
+            app_version="${version}"
+          else
+            # Branch build. SemVer pre-release, so it sorts *below* the eventual
+            # release of the same base version. The run number keeps ordering
+            # monotonic and the `g`-prefixed short SHA keeps it unique and
+            # non-numeric (a bare numeric identifier with a leading zero would
+            # be invalid SemVer).
+            slug="$(printf '%s' "${GITHUB_REF_NAME}" | sed 's/[^0-9A-Za-z-]/-/g')"
+            version="${base}-${slug}.${GITHUB_RUN_NUMBER}.g${GITHUB_SHA:0:7}"
+            # Leave appVersion as declared: on a branch push the image is tagged
+            # `main`, which is exactly what Chart.yaml already says.
+            app_version=""
+          fi
+
+          {
+            echo "version=${version}"
+            echo "app_version=${app_version}"
+          } >>"$GITHUB_OUTPUT"
+
+          echo "Chart version: ${version}"
+          echo "appVersion:    ${app_version:-<as declared in Chart.yaml>}"
+
+      - name: Package chart
+        id: package
+        env:
+          CHART_VERSION: ${{ steps.chart.outputs.version }}
+          CHART_APP_VERSION: ${{ steps.chart.outputs.app_version }}
+        run: |
+          set -euo pipefail
+
+          mkdir -p dist
+
+          # `helm package` does not render templates, so it needs none of the
+          # values a real install requires. It does validate the SemVer we just
+          # built, and fails loudly if it is malformed.
+          if [ -n "${CHART_APP_VERSION}" ]; then
+            helm package "${CHART_DIR}" \
+              --version "${CHART_VERSION}" \
+              --app-version "${CHART_APP_VERSION}" \
+              --destination dist
+          else
+            helm package "${CHART_DIR}" \
+              --version "${CHART_VERSION}" \
+              --destination dist
+          fi
+
+          # Glob rather than `ls`, so the name never round-trips through
+          # word splitting.
+          shopt -s nullglob
+          packaged=(dist/*.tgz)
+          if [ "${#packaged[@]}" -ne 1 ]; then
+            echo "::error::expected exactly one packaged chart, got ${#packaged[@]}"
+            exit 1
+          fi
+
+          echo "file=${packaged[0]}" >>"$GITHUB_OUTPUT"
+          echo "Packaged ${packaged[0]}"
+
+      - name: Log in to GitHub Container Registry
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # Same built-in credential the image job uses; `packages: write` is
+          # already granted above. No repository secret is involved.
+          printf '%s' "${GITHUB_TOKEN}" \
+            | helm registry login ghcr.io --username "${GITHUB_ACTOR}" --password-stdin
+
+      - name: Push chart
+        id: push
+        env:
+          CHART_FILE: ${{ steps.package.outputs.file }}
+        run: |
+          set -euo pipefail
+
+          owner="${GITHUB_REPOSITORY_OWNER,,}"
+          repo="oci://ghcr.io/${owner}/charts"
+
+          helm push "${CHART_FILE}" "${repo}"
+
+          echo "ref=${repo}/codex-pool" >>"$GITHUB_OUTPUT"
+
+      - name: Log out of GitHub Container Registry
+        if: always()
+        run: helm registry logout ghcr.io || true
+
+      - name: Summarise
+        env:
+          CHART_REF: ${{ steps.push.outputs.ref }}
+          CHART_VERSION: ${{ steps.chart.outputs.version }}
+        run: |
+          set -euo pipefail
+          {
+            echo "### Helm chart"
+            echo
+            echo "Published: \`${CHART_REF}:${CHART_VERSION}\`"
+            echo
+            echo "Install it without cloning this repository:"
+            echo '```sh'
+            echo "helm install codex-pool ${CHART_REF} --version ${CHART_VERSION}"
+            echo '```'
+            echo
+            echo "A GHCR package is **private** when it is first created."
+            echo "Make \`charts/codex-pool\` public once under the owner's package"
+            echo "settings, or an anonymous pull will fail."
+          } >>"$GITHUB_STEP_SUMMARY"
